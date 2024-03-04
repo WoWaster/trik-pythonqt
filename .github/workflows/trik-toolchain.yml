@@ -1,0 +1,166 @@
+name: "TRIK toolchain on Ubuntu Latest"
+on:
+  push:
+    branches:
+  pull_request:
+    branches:
+  workflow_dispatch:
+
+jobs:
+  trik-toolchain:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -l {0} # to force import of ~/.bash_profile
+
+    strategy:
+      matrix:
+        pythonqtall-config: ["PythonQtCore PythonQtGui PythonQtMultimedia"]
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Restore TRIK toolchain
+        uses: actions/cache/restore@v4
+        with:
+          path: /opt/trik-sdk
+          key: trik-sdk
+
+      - name: Check if TRIK toolchain is up-to-date
+        id: trik-toolchain-check
+        run: |
+          curl -O https://dl.trikset.com/distro/latest-full/trik-sdk-x86_64-arm926ejse-toolchain-trik-nodistro.0.sh.sha256
+          diff -qN trik-sdk-x86_64-arm926ejse-toolchain-trik-nodistro.0.sh.sha256 \
+                   /opt/trik-sdk/trik-sdk-x86_64-arm926ejse-toolchain-trik-nodistro.0.sh.sha256 \
+                   && echo "install=false" >> $GITHUB_OUTPUT \
+                   || echo "install=true" >> $GITHUB_OUTPUT
+
+      - name: Install TRIK toolchain
+        if: steps.trik-toolchain-check.outputs.install == 'true'
+        run: |
+          rm -rf /opt/trik-sdk
+          curl -O https://dl.trikset.com/distro/latest-full/trik-sdk-x86_64-arm926ejse-toolchain-trik-nodistro.0.sh
+          chmod +x ./trik-sdk-x86_64-arm926ejse-toolchain-trik-nodistro.0.sh
+          ./trik-sdk-x86_64-arm926ejse-toolchain-trik-nodistro.0.sh -y
+          mv trik-sdk-x86_64-arm926ejse-toolchain-trik-nodistro.0.sh.sha256 /opt/trik-sdk
+
+      - name: Save TRIK toolchain
+        if: steps.trik-toolchain-check.outputs.install == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /opt/trik-sdk
+          key: trik-sdk
+
+      - name: Install QEMU with binfmt
+        run: |
+          sudo apt update
+          sudo apt install -y qemu-user-binfmt
+
+      - name: Configure git
+        run: |
+          git --version
+          git config --global core.symlinks true
+          git config --global core.autocrlf false
+
+          #prepare for actions/checkout, otherwise it fails
+          echo "LC_ALL=en_US.utf8" >> $GITHUB_ENV
+          echo "$(dirname $(realpath $(which git)))" >> $GITHUB_PATH
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "PERL5LIB=$PERL5LIB" >> $GITHUB_ENV
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Use ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ github.ref_name }}-${{ github.job }}
+
+      - name: Check available tools
+        run: |
+          set -xeo pipefail
+          . /opt/trik-sdk/environment-setup-arm926ejse-oe-linux-gnueabi
+          uname -a
+          rsync --version
+          qmake --version && qmake -query
+          python3 --version
+          echo $CXX
+          $CXX --version
+          ccache --version
+          qemu-arm --version
+
+      - name: Generate Wrappers
+        run: |
+          . /opt/trik-sdk/environment-setup-arm926ejse-oe-linux-gnueabi
+          export QEMU_LD_PREFIX=/opt/trik-sdk/sysroots/arm926ejse-oe-linux-gnueabi/
+          cd generator
+          UBSAN_OPTIONS="halt_on_error=1" ASAN_OPTIONS="detect_leaks=0:detect_stack_use_after_return=1:fast_unwind_on_malloc=0" \
+          ./pythonqt_generator
+
+      - name: Upload Wrappers
+        uses: actions/upload-artifact@v4
+        with:
+          name: wrappers_trik_sdk
+          path: generated_cpp
+
+      - name: Build PythonQt
+        run: |
+          . /opt/trik-sdk/environment-setup-arm926ejse-oe-linux-gnueabi
+          qmake -r PythonQt.pro CONFIG+=release CONFIG+=force_debug_info \
+                   PYTHONQTALL_CONFIG="${{ matrix.pythonqtall-config }}" \
+                   CONFIG+=sanitizer CONFIG+=sanitize_undefined CONFIG+=sanitize_address \
+                   CONFIG+=generator CONFIG+=tests \
+                   PYTHON_VERSION=$(python3 --version | cut -d " " -f 2 | cut -d "." -f1,2) \
+                   PYTHON_DIR=$(which python3 | xargs dirname | xargs dirname)
+          make -j $(nproc)
+
+      - name: Run Tests
+        run: |
+          . /opt/trik-sdk/environment-setup-arm926ejse-oe-linux-gnueabi
+          PYTHONDEVMODE=1 PYTHONASYNCIODEBUG=1 PYTHONWARNINGS=error PYTHONMALLOC=malloc_debug \
+          UBSAN_OPTIONS="halt_on_error=1" ASAN_OPTIONS="detect_leaks=0:detect_stack_use_after_return=1:fast_unwind_on_malloc=0" \
+          make check TESTARGS="-platform offscreen"
+
+      # - name: "[QEMU + NoPython] QMake"
+      #   timeout-minutes: 1
+      #   run: |
+      #     . /opt/trik-sdk/environment-setup-arm926ejse-oe-linux-gnueabi
+      #     mkdir build-qemu
+      #     cd build-qemu
+      #     qmake CONFIG+=release CONFIG+=tests CONFIG+=noPch CONFIG+=ccache \
+      #           CONFIG+=trik_not_brick CONFIG+=trik_nopython \
+      #           "$GITHUB_WORKSPACE/"
+
+      # - name: "[QEMU + NoPython] QMake all"
+      #   timeout-minutes: 3
+      #   run: |
+      #     . /opt/trik-sdk/environment-setup-arm926ejse-oe-linux-gnueabi
+      #     cd build-qemu
+      #     make -j $(nproc) qmake_all
+
+      # - name: "[QEMU + NoPython] Make all"
+      #   timeout-minutes: 10
+      #   run: |
+      #     . /opt/trik-sdk/environment-setup-arm926ejse-oe-linux-gnueabi
+      #     cd build-qemu
+      #     make -j $(nproc) all
+
+      # - name: "[QEMU + NoPython] Unit tests"
+      #   timeout-minutes: 5
+      #   run: |
+      #     . /opt/trik-sdk/environment-setup-arm926ejse-oe-linux-gnueabi
+      #     cd build-qemu
+      #     # export TRIK_PYTHONPATH=$(python3 -c "import sys; import os; print(os.pathsep.join(sys.path))")
+      #     # export PYTHONVERBOSE=2
+      #     # export PYTHONDEBUG=2
+      #     # export PYTHONMALLOC=malloc_debug
+      #     # export PYTHONFAULTHANDLER=1
+      #     # export PYTHONDEVMODE=1 #only from 3.7, overrides PYTHONMALLOC and some other
+      #     export QEMU_LD_PREFIX=/opt/trik-sdk/sysroots/arm926ejse-oe-linux-gnueabi/
+      #     env | sort
+      #     make -k check TESTARGS="-platform offscreen"
